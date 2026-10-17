@@ -7,9 +7,11 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -756,8 +758,15 @@ def execute_action(action: dict) -> tuple[str, bool]:
 # =====================================================================
 # 10. MAIN AGENT LOOP
 # =====================================================================
-async def run_agent(goal: str, max_steps: int = 30, start_url: str | None = None):
+async def run_agent(
+    goal: str,
+    max_steps: int = 30,
+    start_url: str | None = None,
+    status_callback: Callable[[str], None] | None = None,
+):
     log_path = _start_run_log()
+    if status_callback:
+        status_callback(f"Log file created: {log_path}")
     log_event("run_started", goal=goal, max_steps=max_steps, requested_start_url=start_url, log_path=log_path)
     print(f"Run log: {log_path}")
     executable = _chrome_executable()
@@ -939,13 +948,180 @@ async def run_agent(goal: str, max_steps: int = 30, start_url: str | None = None
 
     final_url = get_current_url()
     log_event("run_finished", steps=len(action_history), final_url=final_url)
+    if status_callback:
+        status_callback(f"Run finished. Log file: {log_path}")
     if _cdp_ws:
         _cdp_ws.close()
     print("\nAutomation session ended.")
 
 
 # =====================================================================
-# 11. ENTRY POINT
+# 11. BASIC DESKTOP GUI
+# =====================================================================
+def launch_tk_gui() -> None:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    root = tk.Tk()
+    root.title("Visual Web Automation")
+    root.geometry("720x460")
+    root.minsize(600, 380)
+
+    goal_label = ttk.Label(root, text="What should the browser do?")
+    goal_label.pack(anchor="w", padx=20, pady=(20, 6))
+
+    goal_input = tk.Text(root, height=5, wrap="word")
+    goal_input.pack(fill="x", padx=20)
+    goal_input.insert("1.0", "Go to Zillow and search for homes in Richmond VA under 300k")
+
+    controls = ttk.Frame(root)
+    controls.pack(fill="x", padx=20, pady=12)
+
+    max_steps_label = ttk.Label(controls, text="Maximum steps:")
+    max_steps_label.pack(side="left")
+    max_steps_input = ttk.Spinbox(controls, from_=1, to=100, width=6)
+    max_steps_input.set("30")
+    max_steps_input.pack(side="left", padx=(8, 16))
+
+    status_var = tk.StringVar(value="Ready")
+    log_var = tk.StringVar(value="No run started yet")
+    status_label = ttk.Label(root, textvariable=status_var, wraplength=680)
+    status_label.pack(anchor="w", padx=20, pady=(4, 8))
+    log_label = ttk.Label(root, textvariable=log_var, wraplength=680)
+    log_label.pack(anchor="w", padx=20, pady=(0, 12))
+
+    start_button = ttk.Button(controls, text="Start automation")
+    start_button.pack(side="left")
+
+    def update_status(message: str) -> None:
+        root.after(0, lambda: status_var.set(message))
+        if "Log file:" in message:
+            root.after(0, lambda: log_var.set(message))
+
+    def run_from_gui() -> None:
+        goal = goal_input.get("1.0", "end").strip()
+        if not goal:
+            messagebox.showwarning("Goal required", "Enter a task for the browser first.")
+            return
+        try:
+            max_steps = int(max_steps_input.get())
+        except ValueError:
+            messagebox.showwarning("Invalid steps", "Maximum steps must be a whole number.")
+            return
+        if max_steps < 1:
+            messagebox.showwarning("Invalid steps", "Maximum steps must be at least 1.")
+            return
+
+        start_button.configure(state="disabled")
+        status_var.set("Starting browser automation...")
+        log_var.set("Creating a new log file...")
+
+        def worker() -> None:
+            try:
+                asyncio.run(run_agent(goal, max_steps=max_steps, status_callback=update_status))
+            except Exception as error:
+                update_status(f"Run stopped with an error: {error}")
+            finally:
+                root.after(0, lambda: start_button.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    start_button.configure(command=run_from_gui)
+    root.mainloop()
+
+
+def launch_web_gui() -> None:
+    import html
+    import json as json_module
+    import threading as threading_module
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    state = {"running": False, "status": "Ready", "log": "No run started yet"}
+
+    def set_status(message: str) -> None:
+        state["status"] = message
+        if "Log file:" in message:
+            state["log"] = message
+
+    class WebGuiHandler(BaseHTTPRequestHandler):
+        def _send(self, body: str, content_type: str = "text/html; charset=utf-8", status: int = 200) -> None:
+            encoded = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_GET(self) -> None:
+            if self.path == "/status":
+                self._send(json_module.dumps(state), "application/json; charset=utf-8")
+                return
+            page = f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Visual Web Automation</title>
+<style>body{{font-family:Arial,sans-serif;max-width:760px;margin:40px auto;padding:0 20px;color:#202124}}textarea{{width:100%;height:120px;padding:10px;font-size:16px}}input{{padding:8px;font-size:16px;width:80px}}button{{padding:10px 18px;font-size:16px;cursor:pointer}}.status{{margin-top:24px;padding:14px;background:#f1f3f4;border-radius:6px;word-break:break-word}}label{{display:block;margin:16px 0 6px}}</style>
+</head><body><h1>Visual Web Automation</h1>
+<form method="post"><label for="goal">What should the browser do?</label>
+<textarea id="goal" name="goal">Go to Zillow and search for homes in Richmond VA under 300k</textarea>
+<label for="max_steps">Maximum steps</label><input id="max_steps" name="max_steps" type="number" min="1" max="100" value="30"><br><br>
+<button type="submit" {"disabled" if state["running"] else ""}>Start automation</button></form>
+<div class="status"><strong>Status:</strong> <span id="status">{html.escape(state["status"])}</span><br><br><strong>Log:</strong> <span id="log">{html.escape(state["log"])}</span></div>
+<script>setInterval(async()=>{{const r=await fetch('/status');const s=await r.json();document.getElementById('status').textContent=s.status;document.getElementById('log').textContent=s.log;}},1000);</script>
+</body></html>"""
+            self._send(page)
+
+        def do_POST(self) -> None:
+            if state["running"]:
+                self._send("A run is already in progress.", status=409)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            fields = parse_qs(self.rfile.read(length).decode("utf-8"))
+            goal = fields.get("goal", [""])[0].strip()
+            try:
+                max_steps = int(fields.get("max_steps", ["30"])[0])
+            except ValueError:
+                max_steps = 30
+            if not goal or max_steps < 1:
+                self._send("Enter a goal and a valid step limit.", status=400)
+                return
+            state["running"] = True
+            state["status"] = "Starting browser automation..."
+            state["log"] = "Creating a new log file..."
+
+            def worker() -> None:
+                try:
+                    asyncio.run(run_agent(goal, max_steps=max_steps, status_callback=set_status))
+                except Exception as error:
+                    set_status(f"Run stopped with an error: {error}")
+                finally:
+                    state["running"] = False
+
+            threading_module.Thread(target=worker, daemon=True).start()
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+
+        def log_message(self, format_string: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), WebGuiHandler)
+    address = f"http://127.0.0.1:{server.server_address[1]}"
+    print(f"Web interface available at {address}")
+    webbrowser.open(address)
+    server.serve_forever()
+
+
+def launch_gui() -> None:
+    try:
+        launch_tk_gui()
+    except Exception as error:
+        print(f"Desktop interface unavailable ({error}). Opening browser interface instead.")
+        launch_web_gui()
+
+
+# =====================================================================
+# 12. ENTRY POINT
 # =====================================================================
 def main():
     import argparse
@@ -953,16 +1129,14 @@ def main():
     parser.add_argument("goal", nargs="?", help="The goal to accomplish")
     parser.add_argument("--url", dest="url", default=None, help="Starting URL (auto-detected from goal if not provided)")
     parser.add_argument("--max-steps", dest="max_steps", type=int, default=30, help="Maximum number of steps (default: 30)")
+    parser.add_argument("--gui", action="store_true", help="Open the desktop interface")
     args = parser.parse_args()
 
-    goal = args.goal
-    if not goal:
-        goal = input("Enter your goal: ").strip()
-    if not goal:
-        print("No goal provided. Exiting.")
+    if args.gui or not args.goal:
+        launch_gui()
         return
 
-    asyncio.run(run_agent(goal, max_steps=args.max_steps, start_url=args.url))
+    asyncio.run(run_agent(args.goal, max_steps=args.max_steps, start_url=args.url))
 
 
 if __name__ == "__main__":
