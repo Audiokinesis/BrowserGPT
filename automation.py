@@ -40,6 +40,13 @@ qwen_llm = ChatOpenAI(
     api_key="ollama",
     model="qwen3-vl:4b-instruct",
     temperature=0.0,
+    max_tokens=128,
+    extra_body={
+        "options": {
+            "num_ctx": 2048,      # Strict limit to save KV cache VRAM
+            "keep_alive": 0       # Unloads immediately after inference
+        }
+    }
 )
 
 llama_llm = ChatOpenAI(
@@ -47,6 +54,13 @@ llama_llm = ChatOpenAI(
     api_key="ollama",
     model="llama3.2",
     temperature=0.0,
+    max_tokens=128,
+    extra_body={
+        "options": {
+            "num_ctx": 2048,      # Strict limit to save KV cache VRAM
+            "keep_alive": 0       # Unloads immediately after inference
+        }
+    }   
 )
 
 # =====================================================================
@@ -214,6 +228,14 @@ def capture_viewport_screenshot(path: str) -> bool:
         image_bytes = base64.b64decode(data)
         with open(path, "wb") as f:
             f.write(image_bytes)
+        try:
+            from PIL import Image
+            with Image.open(path) as image:
+                image.thumbnail((768, 432), Image.Resampling.LANCZOS)
+                image.save(path, format="JPEG", quality=50, optimize=True)
+            log_event("screenshot_resized_for_vision", path=path, max_dimensions=[768, 432])
+        except Exception as resize_error:
+            log_event("screenshot_resize_skipped", path=path, error=repr(resize_error))
         log_event("screenshot_captured", path=path, bytes=len(image_bytes))
         return True
     except Exception as e:
@@ -497,36 +519,23 @@ URL:"""
 # 7. VISION DIRECTIVE (Qwen-VL) — screenshot → coordinate-based actions
 # =====================================================================
 def _build_vlm_prompt(goal: str, history_text: str, stall_warning: str) -> str:
-    return f"""You are a visual web automation agent. Use ONLY the screenshot to identify the next target and action. Do not infer HTML, selectors, element numbers, or hidden controls.
+    return f"""You identify the next browser action from the screenshot.
 
 GOAL: {goal}
-
-PREVIOUS ACTIONS TAKEN:
+RECENT STATE:
 {history_text}{stall_warning}
 
-Choose exactly ONE next action. Return ONLY one valid JSON object on one line. Do not use markdown fences and do not add explanation.
-
-Allowed JSON shapes:
-{{"action":"click","box":[x1,y1,x2,y2],"reason":"short visual description"}}
-{{"action":"type","box":[x1,y1,x2,y2],"text":"text to enter","reason":"short visual description"}}
+Return exactly one JSON object and no explanation.
+Allowed actions:
+{{"action":"click","box":[x1,y1,x2,y2]}}
+{{"action":"type","box":[x1,y1,x2,y2],"text":"exact text"}}
 {{"action":"press","key":"Enter"}}
 {{"action":"scroll","direction":"down"}}
 {{"action":"navigate","url":"https://example.com"}}
 {{"action":"back"}}
 {{"action":"done"}}
 
-BOX RULES:
-- The screenshot is the browser page viewport only; browser tabs and address bar are not included.
-- Use normalized coordinates from 0 to 1000, not pixels. The top-left is [0,0] and bottom-right is [1000,1000].
-- For click, box the entire visible target and place it in the center of that target. Do not click a nearby label, card, map marker, or image.
-- For type, box the visible input itself, not its label. Use the exact text requested by the goal.
-- For the Zillow goal, the visual sequence is: homepage search input -> location suggestion -> For sale mode if needed -> Price control -> maximum price input -> Apply.
-- After every action, wait for the next screenshot. Never combine click and type into one response.
-- If a popup is open, target controls inside the popup before anything behind it.
-- If the page did not change after the previous action, choose a different visible target. Do not repeat Enter or the same coordinates.
-- Use done only when the screenshot visibly shows the requested result and filters.
-
-Your response:"""
+Use normalized coordinates from 0 to 1000. For click/type, box the entire visible control. Choose one action only. Never invent selectors or combine actions. Use done only when the requested result is visibly shown."""
 
 
 async def get_vision_directive(
@@ -539,10 +548,10 @@ async def get_vision_directive(
     with open(screenshot_path, "rb") as image_file:
         base64_image = base64.b64encode(image_file.read()).decode("utf-8")
 
-    history_text = "\n".join(f"  {i+1}. {h}" for i, h in enumerate(history[-8:])) if history else "  (none yet)"
+    history_text = "\n".join(f"- {h}" for h in history[-3:]) if history else "- none"
 
     prompt = _build_vlm_prompt(goal, history_text, stall_warning)
-    log_event("vlm_request", goal=goal, history=history[-8:], stall_warning=stall_warning, prompt=prompt, screenshot=screenshot_path)
+    log_event("vlm_request", goal=goal, history=history[-3:], stall_warning=stall_warning, prompt=prompt, screenshot=screenshot_path)
     message = HumanMessage(content=[
         {"type": "text", "text": prompt},
         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
@@ -591,21 +600,15 @@ async def review_visual_action(
     action: dict,
     history: list[str] | None = None,
 ) -> dict:
-    history_text = ""
-    if history:
-        history_text = "\nRECENT HISTORY:\n" + "\n".join(f"  - {h}" for h in history[-4:])
-    prompt = f"""Review the browser screenshot after one attempted action.
-
+    history_text = "\nRECENT: " + " | ".join(history[-3:]) if history else ""
+    prompt = f"""Check whether this click made progress toward the goal.
 GOAL: {goal}
-ATTEMPTED ACTION: {json.dumps(action, ensure_ascii=False)}
-The red rectangle is the intended target and the red dot is the actual click location. Decide whether the target was correctly identified and whether the visible page now shows progress toward the goal.{history_text}
-
-Return ONLY one JSON object:
-{{"status":"confirmed","reason":"short reason"}}
+CLICK: {json.dumps(action, ensure_ascii=False)}
+The red box marks the intended control and the red dot marks the click. Return one JSON object only.
+{{"status":"confirmed","reason":"brief reason"}}
 OR
-{{"status":"retry","box":[x1,y1,x2,y2],"reason":"short reason"}}
-
-The box must use normalized coordinates from 0 to 1000. Only return retry when a DIFFERENT visible target is clearly needed. If the click landed on the correct element and the page is progressing, return confirmed."""
+{{"status":"retry","box":[x1,y1,x2,y2],"reason":"brief reason"}}
+Retry only when a different visible target is clearly needed. Use normalized coordinates from 0 to 1000.{history_text}"""
     try:
         with open(screenshot_path, "rb") as image_file:
             base64_image = base64.b64encode(image_file.read()).decode("utf-8")
@@ -885,7 +888,8 @@ async def run_agent(
                 is_done = True
                 action_history.append("GOAL CHECK: page title or URL matches the requested subject")
                 log_event("goal_detected_from_page", step=step, title=after_title, url=after_url)
-            if parsed.get("action") == "click" and not is_done:
+            page_changed = after_url != current_url or after_title != page_title
+            if parsed.get("action") == "click" and not is_done and not page_changed:
                 review = await review_visual_action(result_path, goal, parsed, action_history)
                 log_event("visual_review", step=step, review=review)
                 action_history.append(f"VISUAL REVIEW: {review.get('status')} - {review.get('reason', '')}")
@@ -898,6 +902,8 @@ async def run_agent(
                     action_history.append(f"CORRECTED: {correction_desc}")
                     log_event("visual_correction_executed", step=step, action=corrected, description=correction_desc)
                     _wait_for_page_settle()
+            elif parsed.get("action") == "click" and page_changed:
+                log_event("visual_review_skipped", step=step, reason="page_navigation_confirmed", url=after_url, title=after_title)
 
         # Detect repeated click targets by box proximity, not just text
         current_box = parsed.get("box")
